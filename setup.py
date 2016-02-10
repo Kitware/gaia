@@ -63,9 +63,9 @@ setup(
         'Topic :: Scientific/Engineering'
     ],
     keywords='geospatial GIS workflow data',
-    packages=find_packages(exclude=['tests*', 'docs']),
+    packages=find_packages(exclude=['tests*', 'server*', 'docs']),
     require_python='>=2.6',
-    url='https://github.com/OpenGeoscience/gaia',
+    url='https://github.com/kitware/gaia',
     install_requires=requires,
     extras_require=extras
 )
