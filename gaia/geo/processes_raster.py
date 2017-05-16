@@ -22,6 +22,9 @@ from gaia.gaia_process import GaiaProcess
 from gaia.geo.gdal_functions import gdal_calc, gdal_clip
 from gaia.geo.geo_inputs import RasterFileIO
 from gaia import types
+import numpy as np
+from sklearn.cluster import KMeans
+from osgeo import gdal
 
 logger = logging.getLogger('gaia.geo')
 
@@ -141,3 +144,100 @@ class RasterMathProcess(GaiaProcess):
                                      allBands=all_bands,
                                      output_type=otype,
                                      format=self.output_format)
+
+
+class ClusterProcess(GaiaProcess):
+    """
+    Cluster raster dataset to produce cluster assignment raster.
+    """
+    #: Tuple of required inputs; name, type , max # of each; None = no max
+    required_inputs = [
+        {'description': 'Raster to cluster',
+         'type': types.RASTER,
+         'max': 1
+         }
+    ]
+    #: Required arguments for the process
+    required_args = [
+        {
+            'name': 'method',
+            'title': 'Method',
+            'description': 'Clustering algorithm to use.',
+            'type': str
+        },
+        {
+            'name': 'k',
+            'title': 'k',
+            'description': 'Number of clusters.',
+            'type': int
+        }
+    ]
+
+    #: Default output format for the process
+    default_output = formats.RASTER
+
+    def __init__(self, method, k, **kwargs):
+        """
+        Create a process for raster cell clustering.
+
+        :param inputs: Raster to run clustering on.
+        :param method: Clustering algorithm to use.
+        :param k: Number of clusters to use.
+        :param kwargs: Other keyword arguments.
+        :return: ClusterProcess object.
+        """
+        self.method = method
+        self.k = k
+        super(ClusterProcess, self).__init__(**kwargs)
+        if not self.output:
+            self.output = RasterFileIO(name='result', uri=self.get_outpath())
+
+    def compute(self):
+        """
+        Cluster cells, create a raster cluster assignment dataset.
+        """
+
+        def feature_extraction(data):
+            """Handle feature extraction from 3D raster."""
+            # Reshape data as observations by features. Each band is a feature.
+            points = np.array([data[:, i, j]
+                               for i in range(data.shape[1])
+                               for j in range(data.shape[2])
+                               ])
+            return points
+
+        def cluster_kmeans(data, k):
+            """Cluster data using KMeans."""
+            km = KMeans(n_clusters=k, max_iter=1000)
+            labels = km.fit_predict(data)
+            return labels
+
+        # Read data as numpy array.
+        input_image = self.inputs[0].read().ReadAsArray()
+        dims = input_image.shape
+
+        # Handle one band images.
+        if len(dims) == 2:
+            input_image = np.reshape(input_image, (1, dims[0], dims[1]))
+
+        # Extract features.
+        features = feature_extraction(input_image)
+
+        # Cluster.
+        if self.method == "KMeans":
+            labels = cluster_kmeans(features, self.k)
+            # Format labels as raster.
+            labels_image = np.reshape(labels, (dims[-2], dims[-1]))
+            # Features.
+            self.output.features = features
+            # Cluster assignments.
+            driver_mem = gdal.GetDriverByName('MEM')
+            output_image = driver_mem.Create('',
+                                             labels_image.shape[1],
+                                             labels_image.shape[0],
+                                             1,
+                                             gdal.GDT_Int32
+                                             )
+            outBand = output_image.GetRasterBand(1)
+            outBand.WriteArray(labels_image, 0, 0)
+            self.output.labels = output_image
