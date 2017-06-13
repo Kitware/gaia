@@ -1,3 +1,5 @@
+dist: trusty
+
 language: c
 os:
   - linux
@@ -56,5 +58,8 @@ before_script:
   - psql -c 'CREATE EXTENSION postgis;' -U postgres -d travis_ci_test
 
 script:
-  - python -m unittest discover
+  - coverage run --source gaia -m unittest discover
   - flake8 --config tests/flake8.cfg gaia tests
+
+after_success:
+  coveralls
