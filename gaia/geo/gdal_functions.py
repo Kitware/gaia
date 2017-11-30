@@ -34,6 +34,8 @@ import osr
 from PIL import Image, ImageDraw
 from osgeo.gdal_array import BandReadAsArray, BandWriteArray
 from numpy.ma.core import MaskedConstant
+from gaia.geo.rpc import *
+
 
 logger = logging.getLogger('gaia.geo.gdal_functions')
 
@@ -144,26 +146,47 @@ def gdal_clip(raster_input, raster_output, polygon_json, nodata=0):
         a.shape = i.im.size[1], i.im.size[0]
         return a
 
+    def world_to_pixel_poly(rpc_dict, geometry):
+        """
+        Uses a gdal geomatrix (gdal.GetGeoTransform()) to calculate
+        the pixel location of a geospatial coordinate
+        """
+        pixelRing = ogr.Geometry(ogr.wkbLinearRing)
+        geoRing = geometry.GetGeometryRef(0)
+        numPoints = geoRing.GetPointCount()
+        rpc = rpc_from_gdal_dict(rpc_dict)
+
+        for p in range(numPoints):
+            point = numpy.array(map(float, geoRing.GetPoint(p)))
+            pixel, line = rpc.project(point)
+            pixelRing.AddPoint(pixel, line)
+
+        pixelPoly = ogr.Geometry(ogr.wkbPolygon)
+        pixelPoly.AddGeometry(pixelRing)
+
+        return pixelPoly
+
     def world_to_pixel(geoMatrix, x, y):
         """
         Uses a gdal geomatrix (gdal.GetGeoTransform()) to calculate
         the pixel location of a geospatial coordinate
         """
-        ulX = geoMatrix[0]
-        ulY = geoMatrix[3]
-        xDist = geoMatrix[1]
-        pixel = int((x - ulX) / xDist)
-        line = int((ulY - y) / xDist)
+        tX = x - geoMatrix[0]
+        tY = y - geoMatrix[3]
+        a = geoMatrix[1]
+        b = geoMatrix[2]
+        c = geoMatrix[4]
+        d = geoMatrix[5]
+        div = 1.0 / (a * d - b * c)
+        pixel = int((tX * d - tY * b) * div)
+        line = int((tY * a - tX * c) * div)
         return (pixel, line)
 
     src_image = get_dataset(raster_input)
-    # Load the source data as a gdalnumeric array
-    src_array = src_image.ReadAsArray()
-    src_dtype = src_array.dtype
 
-    # Also load as a gdal image to get geotransform
+    # Load as a gdal image to get geotransform
     # (world file) info
-    geo_trans = src_image.GetGeoTransform()
+    geo_trans = gdal_get_transform(src_image)
     nodata_values = []
     for i in range(src_image.RasterCount):
         nodata_value = src_image.GetRasterBand(i+1).GetNoDataValue()
@@ -176,16 +199,44 @@ def gdal_clip(raster_input, raster_output, polygon_json, nodata=0):
         polygon_json = json.dumps(polygon_json)
     poly = ogr.CreateGeometryFromJson(polygon_json)
 
-    # Convert the layer extent to image pixel coordinates
     min_x, max_x, min_y, max_y = poly.GetEnvelope()
-    ul_x, ul_y = world_to_pixel(geo_trans, min_x, max_y)
-    lr_x, lr_y = world_to_pixel(geo_trans, max_x, min_y)
+    rpc_md = src_image.GetMetadata('RPC')
+    pixelPoly = world_to_pixel_poly(rpc_md, poly)
+
+    # Convert the layer extent to image pixel coordinates
+    ul_x, lr_x, ul_y, lr_y = map(int, pixelPoly.GetEnvelope())
+    ul_x = max(0, ul_x)
+    ul_y = max(0, ul_y)
+    lr_x = min(src_image.RasterXSize - 1, lr_x)
+    lr_y = min(src_image.RasterYSize - 1, lr_y)
+
+    samp_off = rpc_md['SAMP_OFF']
+    samp_off = float(samp_off) + ul_x
+    rpc_md['SAMP_OFF'] = str(samp_off)
+
+    line_off = rpc_md['LINE_OFF']
+    line_off = float(line_off) + ul_y
+    rpc_md['LINE_OFF'] = str(line_off)
 
     # Calculate the pixel size of the new image
-    px_width = int(lr_x - ul_x)
-    px_height = int(lr_y - ul_y)
+    # Constrain the width and height to the bounds of the image
+    px_width = int(lr_x - ul_x + 1)
+    if px_width + ul_x > src_image.RasterXSize - 1:
+        px_width = int(src_image.RasterXSize - ul_x - 1)
 
-    clip = src_array[ul_y:lr_y, ul_x:lr_x]
+    px_height = int(lr_y - ul_y + 1)
+    if px_height + ul_y > src_image.RasterYSize - 1:
+        px_height = int(src_image.RasterYSize - ul_y - 1)
+
+    # We've constrained x & y so they are within the image.
+    # If the width or height ends up negative at this point,
+    # the AOI is completely outside the image
+    if px_width < 0 or px_height < 0:
+        return None
+
+    # Load the source data as a gdalnumeric array
+    clip = src_image.ReadAsArray(ul_x, ul_y, px_width, px_height)
+    src_dtype = clip.dtype
 
     # create pixel offset to pass to new image Projection info
     xoffset = ul_x
@@ -222,13 +273,34 @@ def gdal_clip(raster_input, raster_output, polygon_json, nodata=0):
     # create output raster
     raster_band = raster_input.GetRasterBand(1)
     output_driver = gdal.GetDriverByName('MEM')
+
+    # In the event we have multispectral images,
+    # shift the shape dimesions we are after,
+    # since position 0 will be the number of bands
+    clip_shp_0 = clip.shape[0]
+    clip_shp_1 = clip.shape[1]
+    if clip.ndim > 2:
+        clip_shp_0 = clip.shape[1]
+        clip_shp_1 = clip.shape[2]
+
     output_dataset = output_driver.Create(
-        '', clip.shape[1], clip.shape[0],
+        '', clip_shp_1, clip_shp_0,
         raster_input.RasterCount, raster_band.DataType)
     output_dataset.SetGeoTransform(geo_trans)
-    output_dataset.SetProjection(raster_input.GetProjection())
+    output_dataset.SetProjection(gdal_get_projection(raster_input))
+
+    # Copy All metadata data from src to dst
+#    domains = src_image.GetMetadataDomainList()
+#    for tag in domains:
+#        md = src_image.GetMetadata(tag)
+#        if md:
+#            output_dataset.SetMetadata(md, tag)
+
+    # write out the rpc_md that we modified above
+    output_dataset.SetMetadata(rpc_md, 'RPC')
     gdalnumeric.CopyDatasetInfo(raster_input, output_dataset,
                                 xoff=xoffset, yoff=yoffset)
+
     bands = raster_input.RasterCount
     if bands > 1:
         for i in range(bands):
@@ -288,8 +360,8 @@ def gdal_calc(calculation, raster_output, rasters,
             if dimensions != [datasets[i].RasterXSize, datasets[i].RasterYSize]:
                 datasets[i] = gdal_resize(raster,
                                           dimensions,
-                                          datasets[0].GetProjection(),
-                                          datasets[0].GetGeoTransform())
+                                          gdal_get_projection(datasets[0]),
+                                          gdal_get_transform(datasets[0]))
         else:
             dimensions = [datasets[0].RasterXSize, datasets[0].RasterYSize]
 
@@ -324,8 +396,8 @@ def gdal_calc(calculation, raster_output, rasters,
         gdal.GetDataTypeByName(output_type))
 
     # set output geo info based on first input layer
-    output_dataset.SetGeoTransform(datasets[0].GetGeoTransform())
-    output_dataset.SetProjection(datasets[0].GetProjection())
+    output_dataset.SetGeoTransform(gdal_get_transform(datasets[0]))
+    output_dataset.SetProjection(gdal_get_projection(datasets[0]))
 
     if nodata is None:
         nodata = ndv_lookup[output_type]
@@ -467,7 +539,7 @@ def gen_zonalstats(zones_json, raster):
     lyr = shp.GetLayer()
 
     # Get raster georeference info
-    transform = raster.GetGeoTransform()
+    transform = gdal_get_transform(raster)
     xOrigin = transform[0]
     yOrigin = transform[3]
     pixelWidth = transform[1]
@@ -628,3 +700,19 @@ def get_dataset(object):
         return object
     else:
         return gdal.Open(object, gdalconst.GA_ReadOnly)
+
+
+def gdal_get_transform(src_image):
+    geo_trans = src_image.GetGeoTransform()
+    if geo_trans == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
+        geo_trans = gdal.GCPsToGeoTransform(src_image.GetGCPs())
+
+    return geo_trans
+
+
+def gdal_get_projection(src_image):
+    projection = src_image.GetProjection()
+    if projection == '':
+        projection = src_image.GetGCPProjection()
+
+    return projection
